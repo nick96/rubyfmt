@@ -889,7 +889,7 @@ impl BaseParserState {
     }
 
     fn current_spaces(&self) -> ColNumber {
-        2 * self
+        4 * self
             .depth_stack
             .last()
             .expect("depth stack is never empty")
