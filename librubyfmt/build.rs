@@ -1,10 +1,17 @@
-#[cfg(windows)]
+use regex::Regex;
 use std::env;
 use std::error::Error;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 type Output = Result<(), Box<dyn Error>>;
+
+struct RubyConfig {
+    libz: bool,
+    libcrypt: bool,
+}
 
 fn main() -> Output {
     #[cfg(target_os = "linux")]
@@ -23,7 +30,7 @@ fn main() -> Output {
     #[cfg(windows)]
     let ripper = "ext/ripper/ripper.obj";
 
-    let path = std::env::current_dir()?;
+    let path = env::current_dir()?;
     let ruby_checkout_path = path.join("ruby_checkout");
 
     let old_checkout_sha = if ruby_checkout_path.join(ripper).exists() {
@@ -48,20 +55,14 @@ fn main() -> Output {
         }
     }
 
+    let arch = extract_ruby_arch(&ruby_checkout_path);
+
     cc::Build::new()
         .file("src/rubyfmt.c")
         .object(ruby_checkout_path.join(&ripper))
         .include(ruby_checkout_path.join("include"))
-        .include(ruby_checkout_path.join(".ext/include/arm64-darwin20"))
-        .include(ruby_checkout_path.join(".ext/include/arm64-darwin21"))
-        .include(ruby_checkout_path.join(".ext/include/arm64-darwin22"))
-        .include(ruby_checkout_path.join(".ext/include/x86_64-darwin21"))
-        .include(ruby_checkout_path.join(".ext/include/x86_64-darwin20"))
-        .include(ruby_checkout_path.join(".ext/include/x86_64-darwin19"))
-        .include(ruby_checkout_path.join(".ext/include/x86_64-darwin18"))
-        .include(ruby_checkout_path.join(".ext/include/x86_64-linux"))
-        .include(ruby_checkout_path.join(".ext/include/x64-mswin64_140"))
-        .include(ruby_checkout_path.join(".ext/include/i386-mswin32_140"))
+        .include(ruby_checkout_path.join(format!(".ext/include/{}", arch)))
+        .warnings(false)
         .compile("rubyfmt_c");
 
     println!(
@@ -69,13 +70,68 @@ fn main() -> Output {
         ruby_checkout_path.display()
     );
     println!("cargo:rustc-link-lib=static={}", libname);
-    #[cfg(not(windows))]
-    println!("cargo:rustc-link-lib=dylib=z");
 
-    #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=dylib=crypt");
+    let config = extract_ruby_library_config(&ruby_checkout_path, &arch);
+    if config.libz {
+        println!("cargo:rustc-link-lib=dylib=z");
+    }
+    if config.libcrypt {
+        println!("cargo:rustc-link-lib=dylib=crypt");
+    }
 
     Ok(())
+}
+
+fn extract_ruby_arch(ruby_checkout_path: &Path) -> String {
+    let rbconfig_rb = ruby_checkout_path.join("rbconfig.rb");
+    let f = File::open(rbconfig_rb).expect("cannot find rbconfig.rb");
+    let f = BufReader::new(f);
+    // Naturally, rbconfig.rb permits all manner of Ruby syntax to be used
+    // in the values for CONFIG.  Matching arbitrary Ruby inside the value
+    // string via [^"]+ could be a recipe for very confusing error
+    // messages later.  So we deliberately limit the charcters in the
+    // value string here.
+    let arch_regex = Regex::new("  CONFIG\\[\"arch\"\\] = \"(?P<arch>[-a-z0-9_]+)\"")
+        .expect("incorrect regex syntax");
+    for line in f.lines() {
+        let line = line.expect("could not read from rbconfig.rb");
+        let matched = arch_regex
+            .captures(&line)
+            .and_then(|c| c.name("arch"))
+            .map(|s| s.as_str());
+        match matched {
+            Some(name) => return name.to_string(),
+            _ => continue,
+        }
+    }
+
+    panic!("could not extract arch from rbconfig.rb");
+}
+
+fn extract_ruby_library_config(ruby_checkout_path: &Path, arch: &String) -> RubyConfig {
+    let config_h = ruby_checkout_path.join(format!(".ext/include/{}/ruby/config.h", arch));
+    let f = File::open(config_h).unwrap_or_else(|_| panic!("cannot find config.h for {}", arch));
+    let f = BufReader::new(f);
+    let config = RubyConfig {
+        libz: false,
+        libcrypt: false,
+    };
+    f.lines().fold(config, |config, line| {
+        let line = line.expect("could not read from config.h");
+        if line.starts_with("#define HAVE_LIBZ 1") {
+            RubyConfig {
+                libz: true,
+                ..config
+            }
+        } else if line.starts_with("#define HAVE_LIBCRYPT 1") {
+            RubyConfig {
+                libcrypt: true,
+                ..config
+            }
+        } else {
+            config
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -94,11 +150,27 @@ fn make_configure(_: &Path) -> Output {
 
 #[cfg(unix)]
 fn run_configure(ruby_checkout_path: &Path) -> Output {
-    let o = Command::new("./configure")
-        .arg("--without-gmp")
-        .arg("--disable-jit-support")
-        .current_dir(ruby_checkout_path)
-        .status()?;
+    let mut command = Command::new("./configure");
+
+    command.arg("--without-gmp").arg("--disable-jit-support");
+
+    // This is gross, because it's very limited, but it is the simplest
+    // thing we can do, and calling other build systems inside build systems
+    // is destined to be gross anyway.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if env::var("CARGO_CFG_TARGET_ARCH")
+        .map(|v| v == "aarch64")
+        .unwrap_or(false)
+    {
+        command
+            .arg("--target=aarch64-unknown-linux-gnu")
+            .arg("--host=x86_64")
+            .env("CC", "aarch64-linux-gnu-gcc")
+            .env("AR", "aarch64-linux-gnu-ar")
+            .env("RANLIB", "aarch64-linux-gnu-ranlib");
+    }
+
+    let o = command.current_dir(ruby_checkout_path).status()?;
     check_process_success("./configure", o)
 }
 
@@ -123,6 +195,7 @@ fn run_configure(ruby_checkout_path: &Path) -> Output {
 fn build_ruby(ruby_checkout_path: &Path) -> Output {
     let o = Command::new("make")
         .arg("-j")
+        .arg("main")
         .current_dir(ruby_checkout_path)
         .status()?;
     check_process_success("make", o)
@@ -132,6 +205,7 @@ fn build_ruby(ruby_checkout_path: &Path) -> Output {
 fn build_ruby(ruby_checkout_path: &Path) -> Output {
     let o = find_tool("nmake.exe")?
         .to_command()
+        .arg("main")
         .current_dir(ruby_checkout_path)
         .status()?;
     check_process_success("nmake", o)

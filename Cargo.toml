@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "rubyfmt-main"
-version = "0.8.1"
+version = "0.10.0"
 authors = ["Penelope Phippen <penelopedotzone@gmail.com>"]
 edition = "2018"
 
@@ -26,4 +26,3 @@ regex = "1.6.0"
 rubyfmt = { path = "./librubyfmt" }
 serde = { version = "1.0", features = ["derive"] }
 similar = "2.1.0"
-ureq = { version = "2.1.1", features = ["json"] }

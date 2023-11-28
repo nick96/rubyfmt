@@ -830,8 +830,7 @@ pub fn format_method_call(ps: &mut dyn ConcreteParserState, method_call: MethodC
         ps.emit_indent();
     }
 
-    let should_multiline_call_chain = should_multiline_call_chain(ps, &method_call);
-    let MethodCall(_, chain, method, original_used_parens, args, start_end) = method_call;
+    let MethodCall(_, mut chain, method, original_used_parens, args, start_end) = method_call;
 
     debug!("method call!!");
     let use_parens = use_parens_for_method_call(
@@ -842,78 +841,15 @@ pub fn format_method_call(ps: &mut dyn ConcreteParserState, method_call: MethodC
         original_used_parens,
         ps.current_formatting_context(),
     );
+    chain.extend([
+        CallChainElement::IdentOrOpOrKeywordOrConst(method),
+        CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(args, start_end),
+    ]);
 
     ps.with_start_of_line(
         false,
         Box::new(|ps| {
-            let is_indented = format_call_chain(ps, chain, should_multiline_call_chain);
-            if is_indented {
-                ps.start_indent();
-            }
-
-            if use_parens && method.get_name() == ".()" {
-                ps.emit_ident(".".to_string());
-            } else {
-                format_ident(ps, method.into_ident());
-            }
-            let delims = if use_parens {
-                BreakableDelims::for_method_call()
-            } else {
-                BreakableDelims::for_kw()
-            };
-            if !args.is_empty() {
-                if args_has_single_def_expression(&args) {
-                    // If we match `def ...` as the first argument, just
-                    // emit it without any delimiters.
-                    ps.emit_space();
-
-                    if let ArgsAddStarOrExpressionListOrArgsForward::ExpressionList(mut el) = args {
-                        let expr = el.pop().expect("checked the list is not empty");
-
-                        if let Expression::Def(def_expression) = expr {
-                            format_def(ps, def_expression);
-                        } else if let Expression::Defs(defs_expression) = expr {
-                            format_defs(ps, defs_expression);
-                        }
-                    }
-                } else {
-                    let force_single_line = matches!(
-                        args,
-                        ArgsAddStarOrExpressionListOrArgsForward::ArgsForward(..)
-                    );
-
-                    let maybe_end_line = start_end.map(|se| se.1);
-
-                    ps.breakable_of(
-                        delims,
-                        Box::new(|ps| {
-                            ps.with_formatting_context(
-                                FormattingContext::ArgsList,
-                                Box::new(|ps| {
-                                    format_list_like_thing(
-                                        ps,
-                                        args,
-                                        maybe_end_line,
-                                        force_single_line,
-                                    );
-                                    ps.emit_collapsing_newline();
-                                }),
-                            );
-                            debug!("end of format method call");
-                        }),
-                    );
-                    if let Some(end_line) = maybe_end_line {
-                        ps.wind_dumping_comments_until_line(end_line);
-                    }
-                }
-            } else if use_parens {
-                ps.emit_open_paren();
-                ps.emit_close_paren();
-            }
-
-            if is_indented {
-                ps.end_indent();
-            }
+            format_call_chain(ps, chain, Some(use_parens));
         }),
     );
 
@@ -1228,6 +1164,7 @@ pub fn format_begin(ps: &mut dyn ConcreteParserState, begin: Begin) {
         ps.emit_indent()
     }
 
+    let end_line = begin.1.end_line();
     ps.on_line(begin.1 .0);
 
     ps.emit_begin();
@@ -1236,7 +1173,10 @@ pub fn format_begin(ps: &mut dyn ConcreteParserState, begin: Begin) {
         ps.emit_newline();
         ps.with_start_of_line(
             true,
-            Box::new(|ps| format_bodystmt(ps, begin.2, begin.1.end_line())),
+            Box::new(|ps| {
+                format_bodystmt(ps, begin.2, end_line);
+                ps.wind_dumping_comments_until_line(end_line);
+            }),
         );
     }));
 
@@ -1621,6 +1561,7 @@ pub fn format_inner_string(
                     if peekable.peek().is_none() && contents.ends_with('\n') {
                         contents.pop();
                     }
+                    ps.on_line((t.2).0);
                     ps.emit_string_content(contents);
                 }
                 _ => {
@@ -1701,14 +1642,10 @@ pub fn format_heredoc_string_literal(
         Box::new(|ps| {
             let heredoc_type = (hd.1).0;
             let heredoc_symbol = (hd.1).1;
-            ps.emit_heredoc_start(heredoc_type.clone(), heredoc_symbol.clone());
+            let kind = HeredocKind::from_string(&heredoc_type);
+            ps.emit_heredoc_start(heredoc_symbol.clone(), kind);
 
-            ps.push_heredoc_content(
-                heredoc_symbol,
-                HeredocKind::from_string(heredoc_type),
-                parts,
-                end_line,
-            );
+            ps.push_heredoc_content(heredoc_symbol, kind, parts, end_line);
         }),
     );
 
@@ -2807,73 +2744,128 @@ fn can_elide_parens_for_reserved_names(cc: &[CallChainElement]) -> bool {
 fn format_call_chain(
     ps: &mut dyn ConcreteParserState,
     cc: Vec<CallChainElement>,
-    should_multiline_call_chain: bool,
-) -> bool {
+    last_call_use_parens: Option<bool>,
+) {
     if cc.is_empty() {
-        return false;
+        return;
     }
 
-    format_call_chain_elements(ps, cc, should_multiline_call_chain);
+    let first_elem_line = cc.first().unwrap().start_line();
+    if let Some(first_elem_line) = first_elem_line {
+        ps.on_line(first_elem_line);
+    }
+
+    ps.breakable_call_chain_of(
+        cc.clone(),
+        Box::new(|ps| format_call_chain_elements(ps, cc, last_call_use_parens)),
+    );
 
     ps.emit_after_call_chain();
-    should_multiline_call_chain
 }
 
 fn format_call_chain_elements(
     ps: &mut dyn ConcreteParserState,
     cc: Vec<CallChainElement>,
-    render_multiline_chain: bool,
+    // Whether or not to force the last call to use parens. By default, falls back to normal call chain rules.
+    // This is necessary for supporting things like parenthesized methods in `self.method` method chains where
+    // the parens are sometimes semantically meaningful. However, we leave this as optional since not all callers
+    // require this (e.g. `MethodAddArg` doesn't enforce invariants like those).
+    last_call_use_parens: Option<bool>,
 ) {
     let elide_parens = can_elide_parens_for_reserved_names(&cc);
-    let mut has_indented = false;
     // When set, force all `CallChainElement::ArgsAddStarOrExpressionListOrArgsForward`
     // to use parens, even when empty. This handles cases like `super()` where parens matter
     let mut next_args_list_must_use_parens = false;
-    for cc_elem in cc {
-        let mut element_is_super_keyword = false;
+    let last_call_index = cc
+        .iter()
+        .rposition(|cce| matches!(cce, CallChainElement::IdentOrOpOrKeywordOrConst(..)));
+    let mut has_indented = false;
+
+    for (index, cc_elem) in cc.into_iter().enumerate() {
+        let is_last_call_args = if let Some(last_call_index) = last_call_index {
+            index == (last_call_index + 1)
+        } else {
+            false
+        };
 
         match cc_elem {
             CallChainElement::Paren(p) => format_paren(ps, p),
             CallChainElement::IdentOrOpOrKeywordOrConst(i) => {
                 let ident = i.into_ident();
-                element_is_super_keyword = ident.1 == "super";
+                next_args_list_must_use_parens = ident.1 == "super" || ident.1 == ".()";
 
-                format_ident(ps, ident)
+                if ident.1 == ".()" {
+                    ps.emit_ident(".".to_string());
+                } else {
+                    format_ident(ps, ident);
+                }
+                ps.shift_comments();
             }
             CallChainElement::Block(b) => {
                 ps.emit_space();
                 format_block(ps, b)
+                // Shifting comments should be handled by `format_block`, so we don't
+                // need to shift again here.
             }
-            CallChainElement::VarRef(vr) => format_var_ref(ps, vr),
+            CallChainElement::VarRef(vr) => {
+                format_var_ref(ps, vr);
+                ps.shift_comments();
+            }
             CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(aas, start_end) => {
+                let end_line = start_end.map(|se| se.1);
+
                 if !aas.is_empty() || next_args_list_must_use_parens {
-                    let delims = if elide_parens {
-                        BreakableDelims::for_kw()
+                    let use_parens = if next_args_list_must_use_parens {
+                        // Reset for next call
+                        next_args_list_must_use_parens = false;
+                        true
+                    } else if is_last_call_args && last_call_use_parens.is_some() {
+                        last_call_use_parens.unwrap()
                     } else {
+                        !elide_parens
+                    };
+                    let delims = if use_parens {
                         BreakableDelims::for_method_call()
+                    } else {
+                        BreakableDelims::for_kw()
                     };
 
-                    let end_line = start_end.map(|se| se.1);
+                    // For def visiblity modifiers, e.g. `private def ...`
+                    if args_has_single_def_expression(&aas) {
+                        ps.emit_space();
 
-                    ps.breakable_of(
-                        delims,
-                        Box::new(|ps| {
-                            format_list_like_thing(ps, aas, end_line, false);
-                        }),
-                    );
-                    if let Some(end_line) = end_line {
-                        // If we're rendering a single-line chain, force a reset so
-                        // that comments end up at the current indentation level
-                        if !render_multiline_chain {
-                            ps.reset_space_count();
+                        if let ArgsAddStarOrExpressionListOrArgsForward::ExpressionList(el) = aas {
+                            // Cloning here so format_def{s} can take ownership
+                            let expr = el.last().expect("checked the list is not empty").clone();
+
+                            if let Expression::Def(def_expression) = expr {
+                                format_def(ps, def_expression);
+                            } else if let Expression::Defs(defs_expression) = expr {
+                                format_defs(ps, defs_expression);
+                            }
+                            ps.shift_comments();
                         }
-                        ps.wind_dumping_comments_until_line(end_line);
+                    } else {
+                        ps.breakable_of(
+                            delims,
+                            Box::new(|ps| {
+                                format_list_like_thing(ps, aas, end_line, false);
+                            }),
+                        );
+                        if let Some(end_line) = end_line {
+                            // If we're rendering a single-line chain, force a reset so
+                            // that comments end up at the current indentation level
+                            ps.reset_space_count();
+                            ps.wind_dumping_comments_until_line(end_line);
+                        }
                     }
+                } else if is_last_call_args && last_call_use_parens.unwrap_or(false) {
+                    ps.emit_single_line_delims(BreakableDelims::for_method_call());
                 }
             }
             CallChainElement::DotTypeOrOp(d) => {
-                if render_multiline_chain && !has_indented {
-                    ps.start_indent();
+                if !has_indented {
+                    ps.start_indent_for_call_chain();
                     has_indented = true;
                 }
                 let is_double_colon = match &d {
@@ -2881,213 +2873,25 @@ fn format_call_chain_elements(
                     DotTypeOrOp::StringDot(val) => val == "::",
                     _ => false,
                 };
-                if render_multiline_chain
-                    // Separating `::` calls with a newline
-                    // isn't valid syntax
-                    && !is_double_colon
-                {
-                    ps.emit_newline();
-                    ps.emit_indent();
+                if !is_double_colon {
+                    ps.emit_collapsing_newline();
+                    ps.emit_soft_indent();
                 }
                 format_dot(ps, d);
             }
-            CallChainElement::Expression(e) => format_expression(ps, *e),
+            CallChainElement::Expression(e) => {
+                format_expression(ps, *e);
+                // Eagerly render heredocs if they're in the first expression.
+                // We want the full heredoc to get rendered _before_ we emit the
+                // BeginCallChainIndent token so that it gets correctly indented
+                // (or in the case of it being the first expression, _not_ indented).
+                ps.render_heredocs(true);
+            }
         }
-        next_args_list_must_use_parens = element_is_super_keyword;
     }
-
     if has_indented {
-        ps.end_indent();
+        ps.end_indent_for_call_chain();
     }
-}
-
-/// Checks whether a call chain both starts with a heredoc expression
-/// *and* contains a call chain element with a breakable.
-///
-/// In practice, this generally means something like the call chain having something
-/// like a method call with args or a block, e.g.
-///
-/// ```ruby
-/// # `|line|` here is the breakable
-/// <<~FOO.lines.map { |line| p(line) }
-/// FOO
-/// ```
-///
-/// Breakables don't play very nicely with heredoc rendering in call chains,
-/// and it would likely be a pretty hefty refactor to properly support this.
-fn is_heredoc_call_chain_with_breakables(cc_elements: &[CallChainElement]) -> bool {
-    if let Some(CallChainElement::Expression(expr)) = cc_elements.first() {
-        if let Expression::StringLiteral(string_literal) = &**expr {
-            if matches!(string_literal, StringLiteral::Heredoc(..)) {
-                let contains_breakables = cc_elements.iter().any(|cc_elem| match cc_elem {
-                    CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(
-                        ArgsAddStarOrExpressionListOrArgsForward::ExpressionList(list),
-                        ..,
-                    ) => !list.is_empty(),
-                    CallChainElement::Block(..) => true,
-                    _ => false,
-                });
-                return contains_breakables;
-            }
-        }
-    }
-
-    false
-}
-
-/// When to multiling call chains generally relies on a few broadly-applicable rules, but in practice
-/// it has *many* special-cases, because multilining them ends up colliding with other language features in awkward ways.
-///
-/// ## High-level rules
-///
-/// The three main rules that govern whether or not to multiline a method chain is to split across multiple lines if
-/// (1) the user multilined the chain,
-/// (2) the whole chain exceeds the maximum line length, or
-/// (3) the chain contains blocks that are split across multiple lines
-///
-/// That said, both of these have some *very large* asterisks, since there are a lot of contexts in which these
-/// have special cases for various reasons (see below).
-///
-/// ## Special conditions
-///
-/// This is a best-effort listing for the exceptional cases and their rationales
-///
-/// * String embedded expressions
-///   * We currently _never_ multiline in string embexprs, mostly because multilining makes it more difficult
-///     to grok the final whitespace of the string.
-/// * Chains consisting only of var/const refs
-///   * It's pretty common to have something of the shape of `Class.method(args)`, and even if it exceeds the max line length,
-///     multilining generally makes this only more confusing at first glance.
-/// * Chains starting with heredocs
-///   * With the current way breakables work, heredocs at the beginning of call chains will will often render really awkwardly
-///     (for example, in the middle of the argument parameters), so we default to multilining if the chain has both a heredoc
-///     and breakables to work around this.
-/// * Long expressions/blocks at the beggining/end
-///   * It's not uncommon to have call chains that start with extremely long expressions (e.g. a long array literal) but
-///     but have very little following it; similarly, it's fairly common to have a short expression but a *very* long
-///     block call following it (e.g. an `each` or `map` call with most of the logic in it). In these cases, we ignore
-///     these long CallChainElements when calculating the length of the final expression to make some common idioms render nicely.
-fn should_multiline_call_chain(ps: &mut dyn ConcreteParserState, method_call: &MethodCall) -> bool {
-    // Never multiline if we're in an embedded expression
-    if ps.current_formatting_context() == FormattingContext::StringEmbexpr {
-        return false;
-    }
-
-    let MethodCall(_, mut call_chain_to_check, ident, _, args, start_end) = method_call.clone();
-
-    // Add the original method as a call chain element purely for the sake of determining multiling
-    call_chain_to_check.append(&mut vec![
-        CallChainElement::IdentOrOpOrKeywordOrConst(ident),
-        CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(args, start_end),
-    ]);
-
-    let all_op_locations = call_chain_to_check
-        .iter()
-        .filter_map(|cc_elem| match cc_elem {
-            CallChainElement::DotTypeOrOp(dot_type_or_op) => {
-                match dot_type_or_op {
-                    // ColonColon is specially represented in the parser, and
-                    // it can't be properly multilined anyways, so we ignore it here
-                    DotTypeOrOp::ColonColon(..) => None,
-                    DotTypeOrOp::StringDot(..) => None,
-                    DotTypeOrOp::Op(Op(.., start_end))
-                    | DotTypeOrOp::DotType(
-                        DotType::LonelyOperator(LonelyOperator(_, start_end))
-                        | DotType::Dot(Dot(_, start_end)),
-                    ) => Some(start_end.clone()),
-                    DotTypeOrOp::Period(Period(.., linecol)) => {
-                        Some(StartEnd(linecol.0, linecol.0))
-                    }
-                }
-            }
-            _ => None,
-        })
-        .collect::<Vec<StartEnd>>();
-    // Multiline the chain if all the operators (dots, double colons, etc.) are not on the same line
-    if let Some(first_op_start_end) = all_op_locations.first() {
-        let chain_is_user_multilined = !all_op_locations
-            .iter()
-            .all(|op_start_end| op_start_end == first_op_start_end);
-        if chain_is_user_multilined {
-            return true;
-        }
-    }
-
-    // Ignore chains that are basically only method calls, e.g.
-    // ````ruby
-    // Thing.foo(args)
-    // Thing.foo(args) { block! }
-    // ```
-    // These should always stay inline
-    match call_chain_to_check.as_slice() {
-        [CallChainElement::VarRef(..) | CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..)]
-        | [CallChainElement::VarRef(..) | CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(..)]
-        | [CallChainElement::VarRef(..) | CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::Block(..)]
-        | [CallChainElement::VarRef(..) | CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(..), CallChainElement::Block(..)] =>
-        {
-            return false;
-        }
-        [CallChainElement::Expression(maybe_const_ref), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..)]
-        | [CallChainElement::Expression(maybe_const_ref), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(..)]
-        | [CallChainElement::Expression(maybe_const_ref), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::Block(..)]
-        | [CallChainElement::Expression(maybe_const_ref), CallChainElement::DotTypeOrOp(..), CallChainElement::IdentOrOpOrKeywordOrConst(..), CallChainElement::ArgsAddStarOrExpressionListOrArgsForward(..), CallChainElement::Block(..)] => {
-            if matches!(maybe_const_ref.as_ref(), Expression::ConstPathRef(..)) {
-                return false;
-            }
-        }
-        _ => {}
-    }
-
-    if is_heredoc_call_chain_with_breakables(&call_chain_to_check) {
-        return true;
-    }
-
-    // If the first item in the chain is a multiline expression (like a hash or array),
-    // ignore it when checking line length
-    if let Some(CallChainElement::Expression(expr)) = call_chain_to_check.first() {
-        let is_multiline_expression = ps.will_render_as_multiline(Box::new(|ps| {
-            format_expression(ps, expr.as_ref().clone());
-        }));
-
-        if is_multiline_expression {
-            call_chain_to_check.remove(0);
-        }
-    }
-
-    // We don't always want to multiline blocks if their only usage
-    // is at the end of a chain, since it's common to have chains
-    // that end with long blocks, but those blocks don't mean we should
-    // multiline the rest of the chain.
-    //
-    // example:
-    // ```
-    // items.get_all.each do
-    // end
-    // ```
-    if let Some(CallChainElement::Block(..)) = call_chain_to_check.last() {
-        call_chain_to_check.pop();
-    }
-
-    let chain_is_too_long = ps.will_render_beyond_max_line_length(Box::new(|ps| {
-        format_call_chain_elements(ps, call_chain_to_check.clone(), false);
-    }));
-    if chain_is_too_long {
-        return true;
-    }
-
-    let chain_blocks_are_multilined = call_chain_to_check
-        .iter()
-        .filter_map(|elem| match elem {
-            CallChainElement::Block(block) => Some(block.clone()),
-            _ => None,
-        })
-        .any(|block| {
-            ps.will_render_as_multiline(Box::new(|ps| {
-                format_block(ps, block);
-            }))
-        });
-
-    chain_blocks_are_multilined
 }
 
 pub fn format_block(ps: &mut dyn ConcreteParserState, b: Block) {
@@ -3102,14 +2906,13 @@ pub fn format_method_add_block(ps: &mut dyn ConcreteParserState, mab: MethodAddB
         ps.emit_indent();
     }
 
-    let should_multiline_chain = should_multiline_call_chain(ps, &mab.clone().to_method_call());
     let mut chain = (mab.1).into_call_chain();
     chain.push(CallChainElement::Block(mab.2));
 
     ps.with_start_of_line(
         false,
         Box::new(|ps| {
-            format_call_chain(ps, chain, should_multiline_chain);
+            format_call_chain(ps, chain, None);
         }),
     );
 
@@ -3122,6 +2925,36 @@ pub fn is_empty_bodystmt(bodystmt: &Vec<Expression>) -> bool {
     bodystmt.len() == 1 && matches!(bodystmt[0], Expression::VoidStmt(..))
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BraceBlockRenderMethod {
+    /// Blocks consisting only of whitespace and comments:
+    /// ```ruby
+    /// thing.map { |_arg|
+    ///   # Do some things!
+    ///
+    ///   # Some more things!
+    /// }
+    /// ```
+    OnlyComments,
+    /// A completely empty block, e.g. `lambda { }`
+    NoCommentsOrExpressions,
+    /// A block with _exactly_ one expression and nothing else.
+    /// These can stay on a single line and so are closer to "regular"
+    /// breakables since we don't need to worry about comments.
+    /// Example: `thing.map { |arg| arg.itself }`
+    SingleExpressionNoComments,
+    /// A block with multiple expressions, which will always be multilined.
+    /// Example:
+    /// ```ruby
+    /// lambda { |arg|
+    ///   copy = arg.dup
+    ///   change!(copy)
+    ///   copy
+    /// }
+    /// ```
+    MultipleExpressions,
+}
+
 pub fn format_brace_block(ps: &mut dyn ConcreteParserState, brace_block: BraceBlock) {
     let bv = brace_block.1;
     let body = brace_block.2;
@@ -3129,76 +2962,102 @@ pub fn format_brace_block(ps: &mut dyn ConcreteParserState, brace_block: BraceBl
 
     ps.on_line(start_line);
 
-    let new_body = body.clone();
+    let brace_block_render_method = get_brace_block_render_method(ps, start_line, end_line, &body);
 
-    let will_render_multiline =
-        brace_contents_will_render_multiline(ps, start_line, end_line, new_body);
+    ps.inline_breakable_of(
+        BreakableDelims::for_brace_block(),
+        Box::new(|ps| {
+            if let Some(bv) = bv {
+                format_blockvar(ps, bv);
+            }
 
-    ps.emit_ident("{".to_string());
-
-    if let Some(bv) = bv {
-        format_blockvar(ps, bv);
-    }
-
-    render_block_contents(ps, will_render_multiline, body, end_line);
-    ps.emit_ident("}".to_string());
+            render_block_contents(ps, brace_block_render_method, body, end_line);
+        }),
+    );
 }
 
 fn render_block_contents(
     ps: &mut dyn ConcreteParserState,
-    will_render_multiline: bool,
+    brace_block_render_method: BraceBlockRenderMethod,
     body: Vec<Expression>,
     end_line: u64,
 ) {
-    ps.new_block(Box::new(|ps| {
-        ps.with_start_of_line(
-            will_render_multiline,
-            Box::new(|ps| {
-                if will_render_multiline {
-                    ps.emit_newline();
-                } else {
-                    ps.emit_space();
-                }
-                for expr in body.into_iter() {
-                    format_expression(ps, expr);
-                }
-            }),
-        );
-    }));
-    if will_render_multiline {
-        ps.emit_indent();
-    } else {
-        ps.emit_space();
+    // Why is this so complicated? Well, dear reader,
+    // brace blocks are "special" in that they're wrapped in a
+    // breakable but don't work the same as other breakables like hashes/arrays.
+    // Because we have to account for blockvars, and because there are additional
+    // constraints outside of line length (e.g. always multiline if there are
+    // multiple expressions in the block), we split the handling of the initial
+    // whitespace differently for different conditions.
+    match brace_block_render_method {
+        BraceBlockRenderMethod::OnlyComments => {
+            ps.emit_soft_newline();
+            ps.wind_dumping_comments_until_line(end_line);
+            ps.shift_comments();
+            // Force the closing brace on indentation back
+            ps.dedent(Box::new(|ps| ps.emit_soft_indent()));
+            return;
+        }
+        BraceBlockRenderMethod::NoCommentsOrExpressions => {
+            ps.wind_dumping_comments_until_line(end_line);
+            ps.emit_space();
+            return;
+        }
+        BraceBlockRenderMethod::SingleExpressionNoComments => {
+            // Soft newlines are special-cased in breakables to
+            // serve as "anchors" for where to start rendering comments,
+            // so we use them instead of hard newlines so that comments
+            // shift to the correct spot.
+            ps.emit_soft_newline();
+            ps.emit_soft_indent()
+        }
+        BraceBlockRenderMethod::MultipleExpressions => {
+            ps.emit_newline();
+            ps.emit_indent()
+        }
     }
+
+    ps.with_start_of_line(
+        false,
+        Box::new(|ps| {
+            let mut peekable = body.into_iter().peekable();
+            while peekable.peek().is_some() {
+                format_expression(ps, peekable.next().unwrap());
+                ps.emit_soft_newline();
+                if peekable.peek().is_some() {
+                    ps.emit_soft_indent();
+                }
+            }
+            ps.shift_comments();
+        }),
+    );
+    // This is assuming that we're always inside of an `inline_breakable_of` block, which
+    // doesn't handle the indentation for the closing delimeter for us.
+    ps.dedent(Box::new(|ps| ps.emit_soft_indent()));
+
     ps.wind_dumping_comments_until_line(end_line);
 }
 
-fn brace_contents_will_render_multiline(
+fn get_brace_block_render_method(
     ps: &mut dyn ConcreteParserState,
     start_line: u64,
     end_line: u64,
-    body: Vec<Expression>,
-) -> bool {
-    let has_comments = ps.has_comments_in_line(start_line, end_line);
-    let is_multiline = ps.will_render_as_multiline(Box::new(|next_ps| {
-        next_ps.new_block(Box::new(|next_ps| {
-            next_ps.with_start_of_line(
-                true,
-                Box::new(|next_ps| {
-                    next_ps.with_formatting_context(
-                        FormattingContext::CurlyBlock,
-                        Box::new(|next_ps| {
-                            for expr in body.into_iter() {
-                                format_expression(next_ps, expr);
-                            }
-                        }),
-                    );
-                }),
-            );
-        }));
-    }));
+    body: &Vec<Expression>,
+) -> BraceBlockRenderMethod {
+    let has_multiple_expressions = body.len() > 1;
+    if has_multiple_expressions {
+        return BraceBlockRenderMethod::MultipleExpressions;
+    }
 
-    is_multiline || has_comments
+    // Else, force multiline if there are comments inside
+    let has_comments = ps.has_comments_in_line(start_line, end_line);
+    if has_comments && is_empty_bodystmt(body) {
+        BraceBlockRenderMethod::OnlyComments
+    } else if is_empty_bodystmt(body) {
+        BraceBlockRenderMethod::NoCommentsOrExpressions
+    } else {
+        BraceBlockRenderMethod::SingleExpressionNoComments
+    }
 }
 
 pub fn format_do_block(ps: &mut dyn ConcreteParserState, do_block: DoBlock) {
@@ -3226,7 +3085,8 @@ pub fn format_do_block(ps: &mut dyn ConcreteParserState, do_block: DoBlock) {
         true,
         Box::new(|ps| {
             ps.wind_dumping_comments_until_line(end_line);
-            ps.emit_end()
+            ps.emit_end();
+            ps.shift_comments();
         }),
     );
 }
@@ -3358,20 +3218,8 @@ pub fn format_multilinable_mod(
     body: Box<Expression>,
     name: String,
 ) {
-    let new_body = body.clone();
-
     let is_multiline = ps.will_render_as_multiline(Box::new(|next_ps| {
-        let exprs = match *new_body {
-            Expression::Paren(p) => match p.1 {
-                ParenExpressionOrExpressions::Expressions(exprs) => exprs,
-                ParenExpressionOrExpressions::Expression(e) => vec![*e],
-            },
-            e => vec![e],
-        };
-
-        for expr in exprs {
-            format_expression(next_ps, expr);
-        }
+        format_inline_mod(next_ps, conditional.clone(), body.clone(), name.clone())
     }));
 
     if is_multiline {
@@ -3417,6 +3265,7 @@ pub fn format_when_or_else(ps: &mut dyn ConcreteParserState, tail: WhenOrElse) {
                         ps.inline_breakable_of(
                             BreakableDelims::for_when(),
                             Box::new(|ps| {
+                                ps.emit_collapsing_newline();
                                 format_list_like_thing(ps, conditionals, None, false);
                             }),
                         );
@@ -3583,14 +3432,16 @@ pub fn format_stabby_lambda(ps: &mut dyn ConcreteParserState, sl: StabbyLambda) 
             // Curly blocks are always represented as ExpressionLists (stmt_add nodes)
             // while do/end blocks are BodyStmt nodes
             match body {
-                ExpressionListOrBodyStmt::ExpressionList(bud) => {
-                    let b = bud;
-                    let will_render_multiline =
-                        brace_contents_will_render_multiline(ps, start_line, end_line, b.clone());
+                ExpressionListOrBodyStmt::ExpressionList(body) => {
+                    let brace_block_render_method =
+                        get_brace_block_render_method(ps, start_line, end_line, &body);
                     ps.emit_space();
-                    ps.emit_ident("{".to_string());
-                    render_block_contents(ps, will_render_multiline, b, end_line);
-                    ps.emit_ident("}".to_string());
+                    ps.inline_breakable_of(
+                        BreakableDelims::for_brace_block(),
+                        Box::new(|ps| {
+                            render_block_contents(ps, brace_block_render_method, body, end_line);
+                        }),
+                    );
                 }
                 ExpressionListOrBodyStmt::BodyStmt(bs) => {
                     ps.emit_space();
